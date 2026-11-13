@@ -3,12 +3,14 @@ Entries are joined by ``ENTRY_DELIMITER``; budgets are in chars (model-independe
 Module state that tests monkeypatch (``get_memory_dir``, ``fcntl``/``msvcrt``) stays
 in ``tools.memory_tool`` and is read lazily."""
 
+import json
 import logging
 import os
 import re
 import time
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -184,13 +186,78 @@ class MemoryStore:
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *,
-                 memory_enabled: bool = True, user_profile_enabled: bool = True):
+                 memory_enabled: bool = True, user_profile_enabled: bool = True,
+                 memory_growth_limit: int | None = None,
+                 user_growth_limit: int | None = None,
+                 memory_growth_window_seconds: int | None = None,
+                 memory_char_baseline: int | None = None):
         self.memory_entries: list[str] = []
         self.user_entries: list[str] = []
         self.memory_char_limit, self.user_char_limit = memory_char_limit, user_char_limit
         self.memory_enabled, self.user_profile_enabled = memory_enabled, user_profile_enabled
         self._system_prompt_snapshot: dict[str, str] = {"memory": "", "user": ""}
         self._consolidation_failures = 0  # per turn; reset by reset_consolidation_failures()
+        # --- 动态约束（2026-11-13；中枢任务包 §1.5）--------------------------
+        # 固定上限改成「**基线 + 窗口增量**」：总量不再有死上限，只卡「快速膨胀」。
+        #   · memory_growth_limit=None ⇒ **不启用**动态约束（保持旧行为，逐字不变）
+        #   · 基线优先取中枢写的 `memories/.memory_baseline.json`（免重启），
+        #     其次取构造参数 memory_char_baseline，最后回落当前实测体量。
+        #   · 窗口快照每次写/加载时落盘（中枢直写 MEMORY.md **绕过**本工具 ⇒
+        #     内存计数看不到那次写入 ⇒ 必须落盘快照才能量准增量）。
+        self._memory_growth_limit = memory_growth_limit
+        # user profile 的增量预算独立（体量基数小得多，共用 memory 的额度会太宽）
+        self._user_growth_limit = user_growth_limit if user_growth_limit is not None else memory_growth_limit
+        self._memory_growth_window_seconds = int(memory_growth_window_seconds or 0) or None
+        self._memory_char_baseline = memory_char_baseline
+        self._baseline_snapshot: dict[str, Any] = {}
+
+    # --- 动态约束：基线快照 -------------------------------------------------
+
+    def _baseline_path(self, target: str = "memory") -> Path:
+        """基线快照落点：与目标同目录的 `.memory_baseline.json` / `.user_baseline.json`。
+
+        ⚠ 中枢直写 MEMORY.md **绕过**本工具 ⇒ 内存计数看不到那次写入
+        ⇒ 必须落盘快照才能量准「窗口增量」（任务包 §3.3）。
+        """
+        name = ".user_baseline.json" if target == "user" else ".memory_baseline.json"
+        try:
+            from tools import memory_tool  # get_memory_dir is monkeypatched there
+
+            return memory_tool.get_memory_dir() / name
+        except Exception:  # 取不到就退化为「无快照」（不因取目录失败而崩）
+            return Path(name)
+
+    def _read_baseline(self, target: str = "memory") -> dict[str, Any]:
+        """读基线快照（中枢写 / 本工具写）；读不到 ⇒ 空 dict（⇒ 用实时实测兜底）。"""
+        try:
+            p = self._baseline_path(target)
+            if not p.is_file():
+                return {}
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write_baseline(self, target: str, count: int) -> None:
+        """落一份快照：记录「此刻体量 + 此刻时间」⇒ 下次可算窗口增量。
+
+        memory 与 user **各落一份**（分文件）⇒ 两个目标各自的增量独立计算。
+        """
+        growth = self._user_growth_limit if target == "user" else self._memory_growth_limit
+        if not growth:
+            return
+        snap = {
+            "char_count": count,
+            "ts": time.time(),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._baseline_snapshot = snap
+        try:
+            p = self._baseline_path(target)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(snap, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass  # 快照写不进去不该让记忆功能挂掉；下轮仍能靠实时实测兜底
 
     # Per-turn counter of failed at-capacity consolidation attempts; reset at each turn boundary by
     # reset_consolidation_failures() (#42405).
@@ -310,7 +377,49 @@ class MemoryStore:
         return len(ENTRY_DELIMITER.join(self._entries_for(target)))
 
     def _char_limit(self, target: str) -> int:
-        return self.user_char_limit if target == "user" else self.memory_char_limit
+        """该目标的**当前有效上限**（字符数）。
+
+        ⚑ 2026-11-13（中枢任务包 §1.5 / §2.3）：**动态约束**。
+        旧口径 = 固定 `memory_char_limit`（死上限）⇒ 记忆体量涨到顶就再也写不进，
+        逼着模型做无意义的压缩。改成「**基线 + 窗口增量**」：
+
+            有效上限 = max(基线体量, 当前实测体量) + 窗口内允许的增量
+
+        · 总量不再有死上限（基线随实测体量上移）⇒ 只卡「**快速膨胀**」。
+        · `memory_growth_limit` 未配置 ⇒ **完全保持旧行为**（逐字不变，便于回退）。
+        · 基线来源优先级：① 中枢写的 `.memory_baseline.json` ② 构造参数 ③ 当前实测体量。
+        · 窗口快照过期（超过 `memory_growth_window_seconds`）⇒ 增量预算重新可用
+          （窗口是「最近一段时间内允许涨多少」，不是「相对基线永久可涨多少」）。
+
+        ⚠ **user profile 也动态化**（任务包 §2.3 实测告急）：
+          `USER.md` 实测 1,469 / 上限 1,500 ⇒ **只剩 31 字符** ⇒ 下一次写用户记忆
+          几乎必然被拒 ⇒ 固定上限已经挡住了正常写入。动态化后它同样只卡「快速膨胀」。
+          ⚠ 但**中枢闸管不到 USER.md**（hub 只推 MEMORY.md）⇒ 这层的处置责任在 hermes 侧。
+        """
+        growth = self._user_growth_limit if target == "user" else self._memory_growth_limit
+        if not growth:
+            return self.user_char_limit if target == "user" else self.memory_char_limit
+
+        current = self._char_count(target)
+        baseline = self._effective_baseline(target, current)
+        return max(baseline, current) + growth
+
+    def _effective_baseline(self, target: str, current: int) -> int:
+        """基线体量：中枢快照 > 构造参数 > 当前实测。
+
+        ⚠ **user profile 只认当前实测**（不读 memory 的基线）：
+          ① 中枢不推 USER.md ⇒ 快照里没有它；
+          ② 构造参数 `memory_char_baseline` 是 **memory 口径**（实测 14,186）
+          ⇒ 套到 USER.md（1,469）上会让上限虚高 12,717 字符 ⇒ **完全失去约束**。
+        """
+        if target == "memory":
+            snap = self._read_baseline(target)
+            snap_count = snap.get("char_count")
+            if isinstance(snap_count, int) and snap_count > 0:
+                return snap_count
+            if isinstance(self._memory_char_baseline, int) and self._memory_char_baseline > 0:
+                return self._memory_char_baseline
+        return current
 
     def _usage(self, target: str) -> str:
         return f"{self._char_count(target):,}/{self._char_limit(target):,}"
@@ -363,6 +472,9 @@ class MemoryStore:
 
             mkdir_under_hermes_home(path.parent)
             self._write_file(path, result[0])
+            # ⚑ 2026-11-13（动态约束）：写盘后落一份基线快照 ⇒ 下轮能算准「窗口增量」。
+            #   放在 `_write_file` **之后** ⇒ 快照记的是**落盘后**的真实体量。
+            self._write_baseline(target, self._char_count(target))
             extra_fields = result[2] if len(result) > 2 else {}
             return self._success_response(target, result[1], **extra_fields)
 

@@ -1337,6 +1337,12 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                     user_char_limit=mem_config.get("user_char_limit", 1375),
                     memory_enabled=agent._memory_enabled,
                     user_profile_enabled=agent._user_profile_enabled,
+                    # ⚑ 2026-11-13（动态约束，中枢任务包 §1.5）：三个新参数都**可选** ——
+                    #   不配置 ⇒ memory_growth_limit=None ⇒ `_char_limit()` 走旧固定上限（逐字不变）。
+                    memory_growth_limit=mem_config.get("memory_growth_limit"),
+                    user_growth_limit=mem_config.get("user_growth_limit"),
+                    memory_growth_window_seconds=mem_config.get("memory_growth_window_seconds"),
+                    memory_char_baseline=mem_config.get("memory_char_baseline"),
                 )
                 agent._memory_store.load_from_disk()
 
