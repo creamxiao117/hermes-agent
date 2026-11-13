@@ -16,9 +16,9 @@ class _Old:
     """The stored policy of a session frozen on a provider that is disabled now."""
 
     def __init__(self):
-        self.model = 'mimo-v2.6-flash'
-        self._config = {'model': {'provider': 'xiaomi', 'default': 'mimo-v2.6-flash',
-                                  'base_url': 'https://token-plan-cn.xiaomimimo.com/v1'}}
+        self.model = 'm-model'
+        self._config = {'model': {'provider': 'provx', 'default': 'm-model',
+                                  'base_url': 'https://example.invalid/v1'}}
 
     def config(self, authority, *, secrets=True):
         return self._config
@@ -31,8 +31,8 @@ class _Runner:
     @staticmethod
     def _resolve_session_agent_runtime(**_kwargs):
         from hermes_cli.runtime_provider import ProviderDisabledError
-        raise ProviderDisabledError("provider 'xiaomi' is disabled in config "
-                                    "(providers.xiaomi.enabled: false)")
+        raise ProviderDisabledError("provider 'provx' is disabled in config "
+                                    "(providers.provx.enabled: false)")
 
 
 class _Authority:
@@ -52,8 +52,8 @@ def test_a_disabled_provider_does_not_block_switching_away(monkeypatch):
 
     config, route = _current_route(_Authority(), live, _Old())
 
-    assert config['model']['provider'] == 'xiaomi'
-    assert (route.provider, route.model) == ('xiaomi', 'mimo-v2.6-flash')
+    assert config['model']['provider'] == 'provx'
+    assert (route.provider, route.model) == ('provx', 'm-model')
     assert route.api_key == ''
 
 
@@ -62,10 +62,10 @@ def test_a_disabled_provider_still_refuses_to_run(monkeypatch):
     from hermes_cli import runtime_provider
 
     monkeypatch.setattr(runtime_provider, 'load_config',
-                        lambda: {'providers': {'xiaomi': {'enabled': False}}})
+                        lambda: {'providers': {'provx': {'enabled': False}}})
 
     with pytest.raises(runtime_provider.ProviderDisabledError) as excinfo:
-        runtime_provider.resolve_runtime_provider(requested='xiaomi')
+        runtime_provider.resolve_runtime_provider(requested='provx')
 
     assert isinstance(excinfo.value, ValueError)
-    assert 'xiaomi' in str(excinfo.value)
+    assert 'provx' in str(excinfo.value)
